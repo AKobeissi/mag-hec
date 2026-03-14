@@ -46,7 +46,10 @@ MIN_HISTORY_MONTHS = 3
 # ── Selection constraints ─────────────────────────────────────────────────────
 MIN_SELECT_PER_MONTH = 10
 MAX_SELECT_PER_MONTH = 100
-DEFAULT_SELECT       = 50      # default K — tune this on validation set
+# Always select 100: ~317 profitable/month in 2023, max recall = 100/317 = 31.5%
+# F1 is theoretically capped at ~0.48 with perfect precision at K=100
+# Selecting fewer (e.g. K=50) cuts the F1 ceiling to ~0.27 — never worth it
+DEFAULT_SELECT       = 100      # default K — tune this on validation set
 
 # ── Model hyperparameters ─────────────────────────────────────────────────────
 LGBM_PARAMS = {

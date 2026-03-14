@@ -2,12 +2,24 @@
 data_loader.py — Data loading utilities for MAG Energy Solutions Challenge.
 
 Strategy:
-  costs     → pandas  (small monthly file, safe to load all at once)
-  prices    → pandas  (load + immediately aggregate to monthly, free hourly)
+  costs       → pandas  (small monthly file, safe to load all at once)
+  prices      → pandas  (aggregate to monthly immediately, free hourly data)
   sim_monthly → Polars lazy scan (2-3 GB files, never fully loaded into RAM)
   sim_daily   → Polars lazy scan (same approach)
 
-Confirmed schema from your Polars preview:
+CRITICAL — Ground Truth Universe:
+  Both the prices and costs files are SPARSE (only non-zero values stored).
+  An outer join of prices ∪ costs gives only ~729 rows/month and a false
+  71% profit rate — because we only see EIDs that already had activity.
+
+  The TRUE universe is all (EID, MONTH, PEAKID) in sim_monthly: ~12,000/month.
+  When computed over the full sim universe:
+    profitable = 518 / 12,038 ≈ 4.3%  ← matches the case doc's "< 5%"
+
+  Fix: build sim_candidates first (all EIDs from sim), then left-join
+  prices and costs onto it so the missing ones correctly get PR=0, C=0.
+
+Confirmed schema (Polars preview):
   SCENARIOID(i8), EID(i16), DATETIME(datetime[ns]), PEAKID(i8),
   ACTIVATIONLEVEL(f32), WINDIMPACT(f32), SOLARIMPACT(f32),
   HYDROIMPACT(f32), NONRENEWBALIMPACT(f32), EXTERNALIMPACT(f32),
@@ -27,8 +39,17 @@ from config import (
     COSTS_DIR, PRICES_DIR,
     SIM_MONTHLY_PATHS, SIM_DAILY_PATHS,
     COSTS_COLS, PRICES_COLS,
-    SIM_COLS_MONTHLY, SIM_COLS_DAILY,
 )
+
+# Re-export for convenience so callers can do: from data_loader import SIM_MONTHLY_PATHS
+__all__ = [
+    "SIM_MONTHLY_PATHS", "SIM_DAILY_PATHS",
+    "load_costs", "load_prices_and_aggregate",
+    "build_sim_candidate_universe", "compute_ground_truth",
+    "load_sim_monthly_for_target", "aggregate_sim_across_scenarios",
+    "load_sim_daily_first7", "precompute_sim_monthly_all",
+    "add_months", "get_month_range", "summarize_dataframe",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -126,34 +147,263 @@ def load_prices_and_aggregate(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GROUND TRUTH
+# SIM CANDIDATE UNIVERSE  ← must be built BEFORE ground truth
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIM CANDIDATE UNIVERSE  ← union of ALL 4 data sources
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_sim_candidate_universe(
+    sim_monthly_paths: List[Path] = None,
+    sim_daily_paths:   List[Path] = None,
+    pr:                pd.DataFrame = None,
+    costs:             pd.DataFrame = None,
+    start_month: Optional[str] = None,
+    end_month:   Optional[str] = None,
+    cache_path:  Optional[Path] = None,
+) -> pd.DataFrame:
+    """
+    Build the FULL candidate universe: union of all 4 data sources.
+
+    Per organizer clarification:
+      "The ~5% figure is computed against the full opportunity universe —
+       all (EID, MONTH, PEAKID) tuples appearing in ANY of the 4 data
+       sources: prices, costs, sim_daily, and sim_monthly."
+
+    2023 example from organizer:
+      Full universe:    167,426 opportunities (~13,952/month)
+      Profitable:         3,807 (2.3%)
+      sim_monthly alone: ~12,038/month → sim_daily adds ~1,914/month more
+
+    Parameters
+    ----------
+    sim_monthly_paths : list of sim_monthly parquet paths
+    sim_daily_paths   : list of sim_daily parquet paths
+    pr                : monthly PR DataFrame (already loaded) — contributes EIDs
+    costs             : costs DataFrame (already loaded) — contributes EIDs
+    start_month       : e.g. '2020-01'
+    end_month         : e.g. '2024-12'
+    cache_path        : save/load parquet cache (recommended — scans ~15+ GB)
+
+    Returns
+    -------
+    DataFrame: EID, MONTH, PEAKID — one row per unique opportunity in universe
+    """
+    if sim_monthly_paths is None:
+        from config import SIM_MONTHLY_PATHS as _mp
+        sim_monthly_paths = _mp
+    if sim_daily_paths is None:
+        from config import SIM_DAILY_PATHS as _dp
+        sim_daily_paths = _dp
+
+    # ── Load from cache if available ─────────────────────────────────────────
+    if cache_path is not None and Path(cache_path).exists():
+        print(f"  Loading candidate universe from cache: {cache_path}")
+        cached = pd.read_parquet(cache_path)
+        if start_month:
+            cached = cached[cached["MONTH"] >= start_month]
+        if end_month:
+            cached = cached[cached["MONTH"] <= end_month]
+        n = len(cached)
+        months = cached["MONTH"].nunique()
+        avg = n // months if months else 0
+        print(f"  ✓ {n:,} candidates | {cached['EID'].nunique():,} EIDs | "
+              f"{months} months | avg {avg:,}/month\n")
+        return cached
+
+    print("  Building full candidate universe (union of all 4 sources)...")
+    print("  [WARNING] First run scans ~15+ GB of parquet — will be cached.\n")
+
+    # Date filter helper
+    def make_date_filter(lf: pl.LazyFrame) -> pl.LazyFrame:
+        filters = []
+        if start_month:
+            s = pl.lit(start_month + "-01").str.to_datetime("%Y-%m-%d")
+            filters.append(pl.col("DATETIME") >= s)
+        if end_month:
+            tp  = pd.Period(end_month, freq="M") + 1
+            e   = pl.lit(str(tp) + "-01").str.to_datetime("%Y-%m-%d")
+            filters.append(pl.col("DATETIME") < e)
+        if filters:
+            combined = filters[0]
+            for f in filters[1:]:
+                combined = combined & f
+            return lf.filter(combined)
+        return lf
+
+    all_parts: List[pd.DataFrame] = []
+
+    # ── Source 1: sim_monthly ─────────────────────────────────────────────────
+    if sim_monthly_paths:
+        print("  Scanning sim_monthly...")
+        lf = (
+            pl.scan_parquet(sim_monthly_paths)
+            .select(["EID", "DATETIME", "PEAKID"])
+        )
+        lf = make_date_filter(lf)
+        df = (
+            lf.with_columns(
+                pl.col("DATETIME").dt.strftime("%Y-%m").alias("MONTH")
+            )
+            .select(["EID", "MONTH", "PEAKID"])
+            .unique()
+            .collect()
+            .to_pandas()
+        )
+        print(f"    sim_monthly: {len(df):,} unique (EID,MONTH,PEAKID)")
+        all_parts.append(df)
+    else:
+        print("  WARNING: no sim_monthly files found")
+
+    # ── Source 2: sim_daily ───────────────────────────────────────────────────
+    if sim_daily_paths:
+        print("  Scanning sim_daily...")
+        lf = (
+            pl.scan_parquet(sim_daily_paths)
+            .select(["EID", "DATETIME", "PEAKID"])
+        )
+        lf = make_date_filter(lf)
+        df = (
+            lf.with_columns(
+                pl.col("DATETIME").dt.strftime("%Y-%m").alias("MONTH")
+            )
+            .select(["EID", "MONTH", "PEAKID"])
+            .unique()
+            .collect()
+            .to_pandas()
+        )
+        print(f"    sim_daily:   {len(df):,} unique (EID,MONTH,PEAKID)")
+        all_parts.append(df)
+    else:
+        print("  WARNING: no sim_daily files found")
+
+    # ── Source 3: prices (already loaded as monthly PR) ───────────────────────
+    if pr is not None and len(pr) > 0:
+        df = pr[["EID", "MONTH", "PEAKID"]].drop_duplicates().copy()
+        if start_month:
+            df = df[df["MONTH"] >= start_month]
+        if end_month:
+            df = df[df["MONTH"] <= end_month]
+        print(f"    prices:      {len(df):,} unique (EID,MONTH,PEAKID)")
+        all_parts.append(df)
+
+    # ── Source 4: costs ───────────────────────────────────────────────────────
+    if costs is not None and len(costs) > 0:
+        df = costs[["EID", "MONTH", "PEAKID"]].drop_duplicates().copy()
+        if start_month:
+            df = df[df["MONTH"] >= start_month]
+        if end_month:
+            df = df[df["MONTH"] <= end_month]
+        print(f"    costs:       {len(df):,} unique (EID,MONTH,PEAKID)")
+        all_parts.append(df)
+
+    # ── Union all 4 sources ───────────────────────────────────────────────────
+    candidates = (
+        pd.concat(all_parts, ignore_index=True)
+        .drop_duplicates(subset=["EID", "MONTH", "PEAKID"])
+        .sort_values(["MONTH", "EID", "PEAKID"])
+        .reset_index(drop=True)
+    )
+
+    candidates["EID"]    = candidates["EID"].astype(int)
+    candidates["PEAKID"] = candidates["PEAKID"].astype(int)
+    candidates["MONTH"]  = candidates["MONTH"].astype(str)
+
+    n      = len(candidates)
+    months = candidates["MONTH"].nunique()
+    avg    = n // months if months else 0
+
+    print(f"\n  ✓ Full universe: {n:,} candidates | "
+          f"{candidates['EID'].nunique():,} unique EIDs | "
+          f"{months} months | avg {avg:,}/month")
+
+    # Sanity check against organizer's 2023 number
+    n_2023 = len(candidates[
+        (candidates["MONTH"] >= "2023-01") &
+        (candidates["MONTH"] <= "2023-12")
+    ])
+    print(f"  2023 check: {n_2023:,} opportunities "
+          f"(organizer says 167,426 for 2023)")
+
+    # ── Save cache ────────────────────────────────────────────────────────────
+    if cache_path is not None:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        candidates.to_parquet(cache_path, index=False)
+        print(f"  Cached → {cache_path}\n")
+
+    return candidates
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GROUND TRUTH  (corrected — uses sim universe as denominator)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_ground_truth(
     pr: pd.DataFrame,
     costs: pd.DataFrame,
+    sim_candidates: pd.DataFrame,
     months: Optional[list] = None,
 ) -> pd.DataFrame:
     """
-    Join |PR| with costs → profit = |PR| - C, label = (profit > 0).
-    Missing PR or C → 0 (implicit zero rule).
+    Correct ground truth computation using the full sim universe.
 
-    Returns: EID, MONTH, PEAKID, PR, C, profit, is_profitable
+    Universe  = all (EID, MONTH, PEAKID) from sim_monthly     (~12,000/month)
+    PR        = left-joined from prices; missing → 0           (sparse file)
+    C         = left-joined from costs;  missing → 0           (sparse file)
+    profit    = |PR| - C
+    profitable = profit > 0
+
+    This gives ~4-5% profitability, matching the case document.
+    The old outer-join approach gave 71% because it only saw the
+    pre-filtered subset of EIDs that already had non-zero prices or costs.
+
+    Parameters
+    ----------
+    pr             : monthly |PR| per (EID, MONTH, PEAKID) from load_prices_and_aggregate
+    costs          : monthly C  per (EID, MONTH, PEAKID) from load_costs
+    sim_candidates : full universe from build_sim_candidate_universe
+    months         : optional list to filter to specific months
+
+    Returns
+    -------
+    DataFrame: EID, MONTH, PEAKID, PR, C, profit, is_profitable
     """
     if months is not None:
-        pr    = pr[pr["MONTH"].isin(months)]
-        costs = costs[costs["MONTH"].isin(months)]
+        sim_candidates = sim_candidates[sim_candidates["MONTH"].isin(months)]
+        pr             = pr[pr["MONTH"].isin(months)]
+        costs          = costs[costs["MONTH"].isin(months)]
 
-    truth = pr.merge(costs, on=["EID", "MONTH", "PEAKID"], how="outer")
+    # Start from the full sim universe — this is the TRUE denominator
+    truth = sim_candidates[["EID", "MONTH", "PEAKID"]].copy()
+
+    # Left join prices — EIDs missing from prices file have PR = 0
+    truth = truth.merge(pr, on=["EID", "MONTH", "PEAKID"], how="left")
     truth["PR"] = truth["PR"].fillna(0).astype(float)
-    truth["C"]  = truth["C"].fillna(0).astype(float)
+
+    # Left join costs — EIDs missing from costs file have C = 0
+    truth = truth.merge(costs, on=["EID", "MONTH", "PEAKID"], how="left")
+    truth["C"] = truth["C"].fillna(0).astype(float)
+
     truth["profit"]        = truth["PR"] - truth["C"]
     truth["is_profitable"] = (truth["profit"] > 0).astype(int)
 
     n_total = len(truth)
     n_prof  = truth["is_profitable"].sum()
-    print(f"  ✓ Ground truth: {n_total:,} opportunities | "
-          f"{n_prof:,} profitable ({100*n_prof/n_total:.2f}%)\n")
+    rate    = 100 * n_prof / n_total if n_total > 0 else 0
+
+    print(f"  ✓ Ground truth (full sim universe):")
+    print(f"    {n_total:,} total opportunities | "
+          f"{n_prof:,} profitable ({rate:.2f}%)")
+    print(f"    {truth['EID'].nunique():,} unique EIDs | "
+          f"{truth['MONTH'].nunique()} months")
+
+    # Breakdown by PEAKID
+    by_peak = truth.groupby("PEAKID")["is_profitable"].agg(["sum","mean","count"])
+    by_peak.columns = ["n_profitable","rate","n_total"]
+    by_peak["rate_pct"] = (by_peak["rate"] * 100).round(2)
+    print(f"\n    By PEAKID:\n{by_peak.to_string()}\n")
+
     return truth
 
 

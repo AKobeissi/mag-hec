@@ -25,6 +25,7 @@ from data_loader import (
     load_costs,
     load_prices_and_aggregate,
     compute_ground_truth,
+    build_sim_candidate_universe,
     load_sim_monthly_for_target,
     aggregate_sim_across_scenarios,
     precompute_sim_monthly_all,
@@ -110,25 +111,38 @@ def main():
     pr_monthly = load_prices_and_aggregate(PRICES_DIR)
     summarize_dataframe(pr_monthly, "Monthly PR")
 
-    # ── 2. COMPUTE GROUND TRUTH ──────────────────────────────────────────────
-    print("\n[2/5] Computing ground truth...")
+    # ── 2. BUILD FULL CANDIDATE UNIVERSE (all 4 sources) ────────────────────
+    print("\n[2/5] Building full candidate universe (prices ∪ costs ∪ sim_daily ∪ sim_monthly)...")
+    sim_universe_cache = OUTPUT_DIR / "sim_candidates.parquet"
+    sim_candidates = build_sim_candidate_universe(
+        sim_monthly_paths=SIM_MONTHLY_PATHS,
+        sim_daily_paths=SIM_DAILY_PATHS,
+        pr=pr_monthly,
+        costs=costs,
+        start_month=args.start_month,
+        end_month=args.end_month,
+        cache_path=sim_universe_cache,
+    )
+    summarize_dataframe(sim_candidates, "Full Candidate Universe")
 
-    truth = compute_ground_truth(pr_monthly, costs)
-    summarize_dataframe(truth, "Ground Truth")
+    # ── 3. COMPUTE GROUND TRUTH ──────────────────────────────────────────────
+    print("\n[3/5] Computing ground truth (correct universe)...")
+    truth = compute_ground_truth(pr_monthly, costs, sim_candidates)
 
     # Print profitability by peak type
     print("\n  Profitability by PEAKID:")
     print(truth.groupby("PEAKID")["is_profitable"].agg(["sum","mean","count"]))
 
-    # ── 3. WALK-FORWARD VALIDATION (optional) ────────────────────────────────
+    # ── 4. WALK-FORWARD VALIDATION (optional) ────────────────────────────────
     if args.validate:
-        print("\n[3/5] Running walk-forward validation (2020-2022 train → 2023 val)...")
+        print("\n[4/5] Running walk-forward validation...")
         _run_validation(truth, use_ml, use_sim, args.n_select)
     else:
-        print("\n[3/5] Skipping validation (pass --validate to enable)")
+        print("\n[4/5] Skipping validation (pass --validate to enable)")
 
-    # ── 4. GENERATE SELECTIONS ───────────────────────────────────────────────
-    print(f"\n[4/5] Generating selections for {args.start_month} → {args.end_month}...")
+    # ── 5. GENERATE SELECTIONS ───────────────────────────────────────────────
+    print(f"\n[5/5] Generating selections for "
+          f"{args.start_month} → {args.end_month}...")
 
     target_months = get_month_range(args.start_month, args.end_month)
     all_selections = []

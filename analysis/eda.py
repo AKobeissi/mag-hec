@@ -10,13 +10,23 @@ Usage:
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import sys
 
-from config import COSTS_DIR, PRICES_DIR
+# Ensure project root is on sys.path when running this script directly
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+
+from config import COSTS_DIR, PRICES_DIR, OUTPUT_DIR
 from data_loader import (
     load_costs,
     load_prices_and_aggregate,
+    build_sim_candidate_universe,
     compute_ground_truth,
     summarize_dataframe,
+    SIM_MONTHLY_PATHS,
+    SIM_DAILY_PATHS,
 )
 
 
@@ -25,7 +35,7 @@ def run_eda():
     print("  MAG Energy Solutions — Exploratory Data Analysis")
     print("="*65)
 
-    # ── 1. Load data ──────────────────────────────────────────────────────────
+    # ── 1. Load costs and prices ──────────────────────────────────────────────
     print("\n[1] Loading costs...")
     costs = load_costs(COSTS_DIR)
     summarize_dataframe(costs, "Costs")
@@ -34,29 +44,60 @@ def run_eda():
     pr = load_prices_and_aggregate(PRICES_DIR)
     summarize_dataframe(pr, "Monthly PR")
 
-    # ── 2. Ground truth ───────────────────────────────────────────────────────
-    print("\n[3] Computing ground truth...")
-    truth = compute_ground_truth(pr, costs)
+    # ── 2. Build full candidate universe (ALL 4 sources) ─────────────────────
+    print("\n[3] Building full candidate universe (union of all 4 data sources)...")
+    print("    Per organizer: universe = prices ∪ costs ∪ sim_daily ∪ sim_monthly")
+    print("    First run scans ~15 GB — result cached to output/sim_candidates.parquet\n")
 
-    # ── 3. Key EDA questions ──────────────────────────────────────────────────
+    cache_path = OUTPUT_DIR / "sim_candidates.parquet"
+    sim_candidates = build_sim_candidate_universe(
+        sim_monthly_paths=SIM_MONTHLY_PATHS,
+        sim_daily_paths=SIM_DAILY_PATHS,
+        pr=pr,
+        costs=costs,
+        start_month="2020-01",
+        end_month="2024-12",
+        cache_path=cache_path,
+    )
+    summarize_dataframe(sim_candidates, "Full Candidate Universe")
+
+    # ── 3. Correct ground truth ───────────────────────────────────────────────
+    print("\n[4] Computing CORRECT ground truth (sim universe as denominator)...")
+    truth = compute_ground_truth(pr, costs, sim_candidates)
+
+    # Also show the OLD (wrong) calculation for comparison
+    print("\n  [COMPARISON] Old wrong calculation (outer join of prices ∪ costs):")
+    truth_wrong = pr.merge(costs, on=["EID","MONTH","PEAKID"], how="outer")
+    truth_wrong["PR"] = truth_wrong["PR"].fillna(0)
+    truth_wrong["C"]  = truth_wrong["C"].fillna(0)
+    truth_wrong["profit"] = truth_wrong["PR"] - truth_wrong["C"]
+    truth_wrong["is_profitable"] = (truth_wrong["profit"] > 0).astype(int)
+    n_w = len(truth_wrong)
+    p_w = truth_wrong["is_profitable"].sum()
+    print(f"    {n_w:,} rows | {p_w:,} profitable | {100*p_w/n_w:.1f}% ← WRONG (survivorship bias)")
+    print(f"  [CORRECT] Using sim universe: {100*truth['is_profitable'].mean():.1f}% ← matches case doc ~5%\n")
+
+    # ── 4. Key EDA questions ──────────────────────────────────────────────────
 
     print("\n" + "─"*50)
     print("  DATA OVERVIEW")
     print("─"*50)
-    print(f"  Unique EIDs in costs:    {costs['EID'].nunique():,}")
-    print(f"  Unique EIDs in prices:   {pr['EID'].nunique():,}")
-    print(f"  Unique EIDs in truth:    {truth['EID'].nunique():,}")
-    print(f"  Total opportunities:     {len(truth):,}")
-    print(f"  Months covered:          {truth['MONTH'].nunique()}")
+    print(f"  Unique EIDs in costs:         {costs['EID'].nunique():,}")
+    print(f"  Unique EIDs in prices:         {pr['EID'].nunique():,}")
+    print(f"  Unique EIDs in sim universe:   {sim_candidates['EID'].nunique():,}")
+    print(f"  Unique EIDs in truth:          {truth['EID'].nunique():,}")
+    print(f"  Total opportunities (correct): {len(truth):,}")
+    print(f"  Months covered:                {truth['MONTH'].nunique()}")
 
     print("\n" + "─"*50)
-    print("  PROFITABILITY OVERVIEW")
+    print("  PROFITABILITY OVERVIEW (corrected)")
     print("─"*50)
-    print(f"  Overall profit rate:     {100*truth['is_profitable'].mean():.2f}%")
-    print(f"  Total profitable:        {truth['is_profitable'].sum():,}")
-    print(f"  Mean profit (all):       {truth['profit'].mean():.2f}")
-    print(f"  Mean profit (profitable):{truth[truth['is_profitable']==1]['profit'].mean():.2f}")
-    print(f"  Mean profit (losing):    {truth[truth['is_profitable']==0]['profit'].mean():.2f}")
+    print(f"  Overall profit rate:      {100*truth['is_profitable'].mean():.2f}%")
+    print(f"  Total profitable:         {truth['is_profitable'].sum():,}")
+    print(f"  Total unprofitable:       {(~truth['is_profitable'].astype(bool)).sum():,}")
+    print(f"  Mean profit (all):        {truth['profit'].mean():.2f}")
+    print(f"  Mean profit (profitable): {truth[truth['is_profitable']==1]['profit'].mean():.2f}")
+    print(f"  Mean profit (losing):     {truth[truth['is_profitable']==0]['profit'].mean():.2f}")
 
     print("\n  By PEAKID:")
     by_peak = truth.groupby("PEAKID").agg(
@@ -70,14 +111,14 @@ def run_eda():
     by_peak["rate_pct"] = (by_peak["rate"] * 100).round(2)
     print(by_peak.to_string())
 
-    print("\n  By Month (aggregated across EIDs):")
+    print("\n  By Month (sample — first 12):")
     by_month = truth.groupby("MONTH").agg(
-        n_total  = ("is_profitable", "count"),
-        n_profit = ("is_profitable", "sum"),
-        rate     = ("is_profitable", "mean"),
-        pr_mean  = ("PR", "mean"),
-        c_mean   = ("C", "mean"),
-    )
+        n_sim_candidates = ("EID", "count"),
+        n_profitable     = ("is_profitable", "sum"),
+        rate             = ("is_profitable", "mean"),
+        pr_mean          = ("PR", "mean"),
+        c_mean           = ("C", "mean"),
+    ).head(12)
     by_month["rate_pct"] = (by_month["rate"] * 100).round(2)
     print(by_month.to_string())
 
