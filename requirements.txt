@@ -4,3 +4,4 @@ pyarrow
 lightgbm
 scikit-learn
 numpy
+ipykernel
