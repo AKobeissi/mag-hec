@@ -215,16 +215,19 @@ def build_sim_candidate_universe(
     print("  Building full candidate universe (union of all 4 sources)...")
     print("  [WARNING] First run scans ~15+ GB of parquet — will be cached.\n")
 
-    # Date filter helper
+    # Date filter helper — uses Python datetime objects, not pl.lit string conversion
+    # pl.lit("2020-01-01").str.to_datetime() is unreliable across Polars versions
+    from datetime import datetime
+
     def make_date_filter(lf: pl.LazyFrame) -> pl.LazyFrame:
         filters = []
         if start_month:
-            s = pl.lit(start_month + "-01").str.to_datetime("%Y-%m-%d")
-            filters.append(pl.col("DATETIME") >= s)
+            start_dt = datetime.strptime(start_month + "-01", "%Y-%m-%d")
+            filters.append(pl.col("DATETIME") >= pl.lit(start_dt))
         if end_month:
-            tp  = pd.Period(end_month, freq="M") + 1
-            e   = pl.lit(str(tp) + "-01").str.to_datetime("%Y-%m-%d")
-            filters.append(pl.col("DATETIME") < e)
+            tp     = pd.Period(end_month, freq="M") + 1
+            end_dt = datetime.strptime(str(tp) + "-01", "%Y-%m-%d")
+            filters.append(pl.col("DATETIME") < pl.lit(end_dt))
         if filters:
             combined = filters[0]
             for f in filters[1:]:
@@ -237,46 +240,88 @@ def build_sim_candidate_universe(
     # ── Source 1: sim_monthly ─────────────────────────────────────────────────
     if sim_monthly_paths:
         print("  Scanning sim_monthly...")
-        lf = (
-            pl.scan_parquet(sim_monthly_paths)
-            .select(["EID", "DATETIME", "PEAKID"])
-        )
-        lf = make_date_filter(lf)
-        df = (
-            lf.with_columns(
-                pl.col("DATETIME").dt.strftime("%Y-%m").alias("MONTH")
-            )
-            .select(["EID", "MONTH", "PEAKID"])
-            .unique()
-            .collect()
-            .to_pandas()
-        )
-        print(f"    sim_monthly: {len(df):,} unique (EID,MONTH,PEAKID)")
-        all_parts.append(df)
+        existing_paths = [p for p in sim_monthly_paths if Path(p).exists()]
+        if not existing_paths:
+            print("  WARNING: no sim_monthly files found on disk")
+        else:
+            # Scan one file at a time to handle schema differences
+            # (e.g. datetime[ns] vs datetime[us] across years)
+            monthly_parts = []
+            for p in existing_paths:
+                try:
+                    df = (
+                        pl.scan_parquet(p)
+                        .select(["EID", "DATETIME", "PEAKID"])
+                    )
+                    df = make_date_filter(df)
+                    chunk = (
+                        df.with_columns(
+                            pl.col("DATETIME")
+                              .dt.strftime("%Y-%m")
+                              .alias("MONTH")
+                        )
+                        .select(["EID", "MONTH", "PEAKID"])
+                        .unique()
+                        .collect()
+                        .to_pandas()
+                    )
+                    monthly_parts.append(chunk)
+                    print(f"    ✓ {Path(p).name}: "
+                          f"{len(chunk):,} unique (EID,MONTH,PEAKID)")
+                except Exception as e:
+                    print(f"    ✗ {Path(p).name}: ERROR — {e}")
+
+            if monthly_parts:
+                df_monthly = (
+                    pd.concat(monthly_parts, ignore_index=True)
+                    .drop_duplicates()
+                )
+                print(f"    sim_monthly total: {len(df_monthly):,} unique rows")
+                all_parts.append(df_monthly)
     else:
-        print("  WARNING: no sim_monthly files found")
+        print("  WARNING: no sim_monthly files configured")
 
     # ── Source 2: sim_daily ───────────────────────────────────────────────────
     if sim_daily_paths:
         print("  Scanning sim_daily...")
-        lf = (
-            pl.scan_parquet(sim_daily_paths)
-            .select(["EID", "DATETIME", "PEAKID"])
-        )
-        lf = make_date_filter(lf)
-        df = (
-            lf.with_columns(
-                pl.col("DATETIME").dt.strftime("%Y-%m").alias("MONTH")
-            )
-            .select(["EID", "MONTH", "PEAKID"])
-            .unique()
-            .collect()
-            .to_pandas()
-        )
-        print(f"    sim_daily:   {len(df):,} unique (EID,MONTH,PEAKID)")
-        all_parts.append(df)
+        existing_paths = [p for p in sim_daily_paths if Path(p).exists()]
+        if not existing_paths:
+            print("  WARNING: no sim_daily files found on disk")
+        else:
+            daily_parts = []
+            for p in existing_paths:
+                try:
+                    df = (
+                        pl.scan_parquet(p)
+                        .select(["EID", "DATETIME", "PEAKID"])
+                    )
+                    df = make_date_filter(df)
+                    chunk = (
+                        df.with_columns(
+                            pl.col("DATETIME")
+                              .dt.strftime("%Y-%m")
+                              .alias("MONTH")
+                        )
+                        .select(["EID", "MONTH", "PEAKID"])
+                        .unique()
+                        .collect()
+                        .to_pandas()
+                    )
+                    daily_parts.append(chunk)
+                    print(f"    ✓ {Path(p).name}: "
+                          f"{len(chunk):,} unique (EID,MONTH,PEAKID)")
+                except Exception as e:
+                    print(f"    ✗ {Path(p).name}: ERROR — {e}")
+
+            if daily_parts:
+                df_daily = (
+                    pd.concat(daily_parts, ignore_index=True)
+                    .drop_duplicates()
+                )
+                print(f"    sim_daily total: {len(df_daily):,} unique rows")
+                all_parts.append(df_daily)
     else:
-        print("  WARNING: no sim_daily files found")
+        print("  WARNING: no sim_daily files configured")
 
     # ── Source 3: prices (already loaded as monthly PR) ───────────────────────
     if pr is not None and len(pr) > 0:
@@ -438,12 +483,12 @@ def load_sim_monthly_for_target(
         print("  WARNING: no sim_monthly files found — check SIM_MONTHLY_PATHS in config.py")
         return None
 
-    # Parse target month boundaries for filter
-    target_start = pl.lit(target_month + "-01").str.to_datetime("%Y-%m-%d")
-    # End = first day of the month after target
-    tp = pd.Period(target_month, freq="M")
-    next_month = str(tp + 1)
-    target_end = pl.lit(next_month + "-01").str.to_datetime("%Y-%m-%d")
+    # Use Python datetime objects for reliable date filtering
+    from datetime import datetime as dt
+    tp       = pd.Period(target_month, freq="M")
+    start_dt = dt(tp.year, tp.month, 1)
+    next_tp  = tp + 1
+    end_dt   = dt(next_tp.year, next_tp.month, 1)
 
     print(f"  Scanning sim_monthly for {target_month} "
           f"across {len(paths)} file(s)...")
@@ -451,10 +496,9 @@ def load_sim_monthly_for_target(
     try:
         lf = (
             pl.scan_parquet(paths)
-            # Filter to only target month rows (pushed down to parquet read)
             .filter(
-                (pl.col("DATETIME") >= target_start) &
-                (pl.col("DATETIME") < target_end)
+                (pl.col("DATETIME") >= pl.lit(start_dt)) &
+                (pl.col("DATETIME") <  pl.lit(end_dt))
             )
             # Select only columns we need
             .select([
@@ -607,14 +651,11 @@ def load_sim_daily_first7(
     if not paths:
         return None
 
-    # Days 1-7 of cutoff_month (HE convention: last valid = day8 00:00:00)
-    month_start = cutoff_month + "-01"
-    # Day 8 00:00:00 = HE 24 of day 7 = last valid timestamp
-    tp = pd.Period(cutoff_month, freq="M")
-    day8 = f"{cutoff_month}-08"
-
-    start_dt = pl.lit(month_start).str.to_datetime("%Y-%m-%d")
-    end_dt   = pl.lit(day8).str.to_datetime("%Y-%m-%d")
+    # Use Python datetime for reliable filtering
+    from datetime import datetime as dt
+    tp       = pd.Period(cutoff_month, freq="M")
+    start_dt = dt(tp.year, tp.month, 1)
+    end_dt   = dt(tp.year, tp.month, 8)   # day 8 00:00:00 = HE 24 of day 7
 
     print(f"  Scanning sim_daily for first 7 days of {cutoff_month}...")
 
@@ -622,8 +663,8 @@ def load_sim_daily_first7(
         lf = (
             pl.scan_parquet(paths)
             .filter(
-                (pl.col("DATETIME") >= start_dt) &
-                (pl.col("DATETIME") <= end_dt)
+                (pl.col("DATETIME") >= pl.lit(start_dt)) &
+                (pl.col("DATETIME") <= pl.lit(end_dt))
             )
             .select(["SCENARIOID", "EID", "PEAKID", "PSD"])
             .group_by(["EID", "PEAKID", "SCENARIOID"])
