@@ -1,80 +1,65 @@
-# test_scan.py — paste and run this directly
-import polars as pl
+import pandas as pd
+import numpy as np
 from pathlib import Path
-import traceback
+from data_loader import load_costs, load_prices_and_aggregate, compute_ground_truth, get_month_range
 
-base = Path(r"C:\Users\akobe\OneDrive\Documents\mag-hec\data")
+OUTPUT_DIR = Path(r"C:\Users\akobe\OneDrive\Documents\mag-hec\output")
 
-monthly_paths = [
-    base / "sim_monthly" / "sim_monthly_2020.parquet",
-    base / "sim_monthly" / "sim_monthly_2021.parquet",
-    base / "sim_monthly" / "sim_monthly_2022.parquet",
-    base / "sim_monthly" / "sim_monthly_2023.parquet",
-    base / "sim_monthly" / "sim_monthly_2024.parquet",
-]
+price_preds = pd.read_parquet(OUTPUT_DIR / "predicted_prices.parquet")
+cost_preds  = pd.read_parquet(OUTPUT_DIR / "predicted_costs.parquet")
+costs       = load_costs()
+pr          = load_prices_and_aggregate()
+sim_candidates = pd.read_parquet(OUTPUT_DIR / "sim_candidates.parquet")
+truth_df    = compute_ground_truth(pr, costs, sim_candidates,
+                                    months=get_month_range("2023-01","2023-12"))
 
-daily_paths = [
-    base / "sim_daily" / "sim_daily_2020.parquet",
-    base / "sim_daily" / "sim_daily_2021.parquet",
-    base / "sim_daily" / "sim_daily_2022.parquet",
-    base / "sim_daily" / "sim_daily_2023.parquet",
-    base / "sim_daily" / "sim_daily_2024.parquet",
-]
+combined = price_preds.merge(
+    cost_preds[["EID","PEAKID","TARGET_MONTH","predicted_c"]],
+    on=["EID","PEAKID","TARGET_MONTH"], how="left"
+).fillna(0)
 
-# Step 1: check files exist
-print("=== FILE CHECK ===")
-for p in monthly_paths + daily_paths:
-    exists = p.exists()
-    size   = f"{p.stat().st_size/1e9:.2f} GB" if exists else "MISSING"
-    print(f"  {'✓' if exists else '✗'} {p.name:35s} {size}")
+combined = combined.merge(
+    truth_df.rename(columns={"MONTH":"TARGET_MONTH"})[
+        ["EID","PEAKID","TARGET_MONTH","PR","C","profit","is_profitable"]
+    ],
+    on=["EID","PEAKID","TARGET_MONTH"], how="inner"
+).fillna(0)
 
-# Step 2: try scanning sim_monthly one file at a time
-print("\n=== SCAN sim_monthly ONE FILE AT A TIME ===")
-for p in monthly_paths:
-    if not p.exists():
-        print(f"  SKIP {p.name} — not found")
-        continue
-    try:
-        result = (
-            pl.scan_parquet(p)
-            .select(["EID", "DATETIME", "PEAKID"])
-            .limit(10)
-            .collect()
-        )
-        print(f"  ✓ {p.name} — ok, schema: {result.schema}")
-    except Exception as e:
-        print(f"  ✗ {p.name} — ERROR: {e}")
-        traceback.print_exc()
+val_months = get_month_range("2023-01","2023-12")
 
-# Step 3: try scanning sim_daily one file at a time
-print("\n=== SCAN sim_daily ONE FILE AT A TIME ===")
-for p in daily_paths:
-    if not p.exists():
-        print(f"  SKIP {p.name} — not found")
-        continue
-    try:
-        result = (
-            pl.scan_parquet(p)
-            .select(["EID", "DATETIME", "PEAKID"])
-            .limit(10)
-            .collect()
-        )
-        print(f"  ✓ {p.name} — ok, schema: {result.schema}")
-    except Exception as e:
-        print(f"  ✗ {p.name} — ERROR: {e}")
-        traceback.print_exc()
+# Test multiple scoring strategies
+strategies = {
+    "A: price only":       combined["predicted_pr"],
+    "B: price - cost":     combined["predicted_pr"] - combined["predicted_c"],
+    "C: soft α=0.3":       combined["predicted_pr"] * np.exp(
+                               -0.3 * combined["predicted_c"] /
+                               (combined["predicted_pr"] + 1e-9)),
+    "D: soft α=0.5":       combined["predicted_pr"] * np.exp(
+                               -0.5 * combined["predicted_c"] /
+                               (combined["predicted_pr"] + 1e-9)),
+    "E: soft α=1.0":       combined["predicted_pr"] * np.exp(
+                               -1.0 * combined["predicted_c"] /
+                               (combined["predicted_pr"] + 1e-9)),
+}
 
-# Step 4: try scanning ALL monthly together (this is what crashed)
-print("\n=== SCAN ALL sim_monthly TOGETHER ===")
-existing = [p for p in monthly_paths if p.exists()]
-try:
-    result = (
-        pl.scan_parquet(existing)
-        .select(["EID", "DATETIME", "PEAKID"])
-        .limit(10)
-        .collect()
-    )
-    print(f"  ✓ Combined scan ok — {len(result)} rows")
-except Exception as e:
-    print(f"  ✗ Combined scan ERROR: {e}")
-    traceback.print_exc()
+print(f"\n{'Strategy':<20} {'Precision':>10} {'Net Profit':>14} "
+      f"{'Std':>12} {'Worst Month':>14}")
+print("-" * 75)
+
+for name, score_col in strategies.items():
+    combined["score"] = score_col
+    results = []
+    for month in val_months:
+        grp    = combined[combined["TARGET_MONTH"] == month]
+        top100 = grp.nlargest(100, "score")
+        results.append({
+            "month":  month,
+            "n_prof": top100["is_profitable"].sum(),
+            "profit": top100["profit"].sum()
+        })
+    df_r = pd.DataFrame(results)
+    prec = df_r["n_prof"].sum() / 1200
+    print(f"{name:<20} {100*prec:>9.1f}%  "
+          f"{df_r['profit'].sum():>14,.0f}  "
+          f"{df_r['profit'].std():>12,.0f}  "
+          f"{df_r['profit'].min():>14,.0f}")

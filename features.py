@@ -1,359 +1,497 @@
 """
-features.py — Feature engineering for MAG Energy Solutions Challenge.
+features.py — Complete feature engineering for MAG Energy Solutions Challenge.
 
-All features respect the anti-leakage rule:
-  For target month M+1, only data available on the 7th of month M is used.
+ONE file, all features. Replaces both the old features.py and price_predictor.py.
 
-Feature groups:
-  1. Cost features     — estimated M+1 cost from history
-  2. PR features       — historical realized price patterns
-  3. Profitability     — historical profit/loss patterns
-  4. Sim monthly       — forward-looking PSM signal (primary signal)
-  5. Sim calibration   — how well are sims tracking reality this month
-  6. Temporal          — month-of-year seasonality
+What we are predicting:
+    profit = |PR_{M+1}| - C_{M+1} > 0   →   is_profitable (binary label)
+
+    BOTH PR and C for M+1 are unknown at decision time (day 7 of month M).
+    We build features that estimate them using only allowed data:
+      - sim_monthly PSM     → proxy for future |PR|   (allowed: produced before day 7)
+      - historical prices   → persistence signal for PR
+      - historical costs    → estimate future C
+      - sim ACTIVATIONLEVEL → predicts whether EID will activate at all
+
+Key findings from EDA that shape feature design:
+    - 3.29% base profitability rate (not 5% — we confirmed 3.29%)
+    - 98.4% of candidates have C=0 → task = predict activation (PR > 0)
+    - Seasonal lift: P(profitable | profitable LY) = 27.6% vs 1.9% (+25.7%)
+    - 50:1 profit asymmetry → optimize recall, always select 100
+    - ~247 EIDs have ≥ 50% profit rate → persistence is concentrated
+
+Anti-leakage:
+    For target_month M+1, all features use only data from months < M+1.
+    Specifically:
+      - prices:       up to and including day 7 of month M (we use full months < M+1)
+      - costs:        up to and including month M
+      - sim_monthly:  for month M+1 (explicitly allowed — produced before day 7 of M)
+      - sim_daily:    not used in features (used for calibration only, optional)
 """
 
-import pandas as pd
-import numpy as np
+import sys
+import time
+from pathlib import Path
 from typing import Optional
-import warnings
-warnings.filterwarnings("ignore")
 
-from config import (
-    LOOKBACK_SHORT, LOOKBACK_MEDIUM, LOOKBACK_LONG, LOOKBACK_LONG2
-)
-from data_loader import (
-    add_months,
-    load_sim_monthly_for_target,
-    aggregate_sim_across_scenarios,
-)
+import numpy as np
+import pandas as pd
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR   = SCRIPT_DIR.parent if SCRIPT_DIR.name in ("analysis", "src") else SCRIPT_DIR
+sys.path.insert(0, str(ROOT_DIR))
+
+from data_loader import add_months
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE FEATURE BUILDER
+# MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_features_for_month(
+def build_features(
+    candidates:   pd.DataFrame,
     target_month: str,
-    truth: pd.DataFrame,
-    sim_agg: Optional[pd.DataFrame] = None,
-    calibration_df: Optional[pd.DataFrame] = None,
+    truth_past:   pd.DataFrame,
+    sim_agg:      Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
-    Build the full feature matrix for all (EID, PEAKID) candidates
-    for a given target_month (M+1).
+    Build the complete feature matrix for all candidates in one target month.
 
     Parameters
     ----------
-    target_month    : str   e.g. '2022-03'  (this is M+1)
-    truth           : DataFrame  full ground truth (EID, MONTH, PEAKID,
-                                 PR, C, profit, is_profitable)
-                      *** Must already be filtered to months < target_month ***
-    sim_agg         : DataFrame  aggregated sim_monthly output for target_month
-                      (from aggregate_sim_monthly_across_scenarios)
-    calibration_df  : DataFrame  sim calibration accuracy for cutoff month
+    candidates   : DataFrame (EID, PEAKID) — the universe of candidates to score
+                   Typically: sim_candidates filtered to target_month
+    target_month : str e.g. '2022-06' — the month we predict (M+1)
+    truth_past   : full truth table filtered STRICTLY to months < target_month
+                   Columns: EID, MONTH, PEAKID, PR, C, profit, is_profitable
+                   Anti-leakage: caller must enforce this filter
+    sim_agg      : aggregated sim_monthly for target_month
+                   Output of aggregate_sim_across_scenarios()
+                   Pass None if sim data unavailable
 
     Returns
     -------
     DataFrame: one row per (EID, PEAKID) with all features + TARGET_MONTH
     """
-    cutoff_month = add_months(target_month, -1)   # month M
+    t0 = time.time()
 
-    # ── Candidate universe ────────────────────────────────────────────────────
-    # All (EID, PEAKID) seen in any historical data
-    # If sim_agg available, use those as the primary candidates
+    # Reference months for seasonal lookups
+    same_month_ly  = add_months(target_month, -12)
+    same_month_2ly = add_months(target_month, -24)
+    same_month_3ly = add_months(target_month, -36)
+
+    # ── Pre-filter truth to lookback window once ──────────────────────────────
+    # 36 months back for 3-year seasonal features
+    # This keeps the truth table small before the groupby
+    lookback_start = add_months(target_month, -36)
+    truth_window   = truth_past[truth_past["MONTH"] >= lookback_start].copy()
+
+    # ── Pre-group by (EID, PEAKID) once — O(n) not O(n²) ────────────────────
+    # Without this, filtering a 750k-row truth table 12,000 times per month
+    # would take hours. With pre-grouping, each lookup is a dict key check.
+    grouped = {
+        key: grp.sort_values("MONTH")
+        for key, grp in truth_window.groupby(["EID", "PEAKID"])
+    }
+    empty = pd.DataFrame(columns=truth_window.columns)
+
+    # ── Index sim_agg by (EID, PEAKID) for O(1) lookup ───────────────────────
+    sim_index = {}
     if sim_agg is not None and len(sim_agg) > 0:
-        candidates = sim_agg[["EID", "PEAKID"]].drop_duplicates().copy()
-        print(f"    Candidates from sim_monthly: {len(candidates):,}")
-    else:
-        candidates = (truth[["EID", "PEAKID"]]
-                      .drop_duplicates()
-                      .copy())
-        print(f"    Candidates from history: {len(candidates):,}")
+        for _, row in sim_agg.iterrows():
+            sim_index[(int(row["EID"]), int(row["PEAKID"]))] = row
 
-    # ── Historical features (per EID, PEAKID) ────────────────────────────────
-    hist_feats = _build_historical_features(
-        candidates, truth, target_month, cutoff_month
-    )
-
-    # ── Merge sim_monthly features ────────────────────────────────────────────
-    if sim_agg is not None and len(sim_agg) > 0:
-        sim_feats = _build_sim_features(sim_agg, hist_feats)
-        features = hist_feats.merge(
-            sim_feats.drop(columns=["EID","PEAKID"], errors="ignore"),
-            left_index=True, right_index=True, how="left"
-        )
-        # Re-merge properly
-        features = hist_feats.merge(sim_agg, on=["EID","PEAKID"], how="left")
-        features = _build_sim_features_merged(features, hist_feats)
-    else:
-        features = hist_feats.copy()
-
-    # ── Calibration features ──────────────────────────────────────────────────
-    if calibration_df is not None and len(calibration_df) > 0:
-        features = features.merge(
-            calibration_df, on=["EID","PEAKID"], how="left"
-        )
-
-    # ── Temporal features ─────────────────────────────────────────────────────
-    features = _add_temporal_features(features, target_month)
-
-    features["TARGET_MONTH"] = target_month
-    features = features.fillna(0)
-
-    return features
-
-
-def _build_historical_features(
-    candidates: pd.DataFrame,
-    truth: pd.DataFrame,
-    target_month: str,
-    cutoff_month: str,
-) -> pd.DataFrame:
-    """
-    Build cost, PR, and profitability features from historical truth data.
-    """
-    same_month_ly = add_months(target_month, -12)
-    same_month_2y = add_months(target_month, -24)
-
+    # ── Build one feature row per candidate ──────────────────────────────────
     rows = []
+    for _, cand in candidates.iterrows():
+        eid    = int(cand["EID"])
+        peakid = int(cand["PEAKID"])
 
-    for _, row in candidates.iterrows():
-        eid    = row["EID"]
-        peakid = row["PEAKID"]
-
-        # Filter to this EID/PEAKID history
-        g = truth[
-            (truth["EID"]    == eid) &
-            (truth["PEAKID"] == peakid) &
-            (truth["MONTH"]  <= cutoff_month)
-        ].sort_values("MONTH")
-
+        g    = grouped.get((eid, peakid), empty)
+        sim  = sim_index.get((eid, peakid), None)
         feat = {"EID": eid, "PEAKID": peakid}
 
-        if len(g) == 0:
-            # New EID — no history, fill zeros
-            rows.append(feat)
-            continue
-
-        # ── Cost features ─────────────────────────────────────────────────────
-        feat["cost_last"]          = g["C"].iloc[-1]
-        feat["cost_avg_3m"]        = g["C"].tail(LOOKBACK_SHORT).mean()
-        feat["cost_avg_6m"]        = g["C"].tail(LOOKBACK_MEDIUM).mean()
-        feat["cost_avg_12m"]       = g["C"].tail(LOOKBACK_LONG).mean()
-        feat["cost_std_12m"]       = g["C"].tail(LOOKBACK_LONG).std()
-        feat["cost_cv_12m"]        = (feat["cost_std_12m"] /
-                                      (feat["cost_avg_12m"] + 1e-9))
-
-        # Same-month last year cost (strong seasonal signal)
-        ly = g[g["MONTH"] == same_month_ly]["C"]
-        feat["cost_same_month_ly"] = ly.iloc[0] if len(ly) > 0 else feat["cost_avg_12m"]
-
-        ly2 = g[g["MONTH"] == same_month_2y]["C"]
-        feat["cost_same_month_2y"] = ly2.iloc[0] if len(ly2) > 0 else feat["cost_avg_12m"]
-
-        # Cost trend (positive = cost rising)
-        if len(g) >= 3:
-            recent_costs = g["C"].tail(6).values
-            feat["cost_trend"] = np.polyfit(
-                range(len(recent_costs)), recent_costs, 1
-            )[0]
-        else:
-            feat["cost_trend"] = 0.0
-
-        feat["is_zero_cost_hist"] = int(feat["cost_avg_12m"] == 0)
-
-        # ── PR (realized price) features ──────────────────────────────────────
-        feat["pr_avg_3m"]          = g["PR"].tail(LOOKBACK_SHORT).mean()
-        feat["pr_avg_6m"]          = g["PR"].tail(LOOKBACK_MEDIUM).mean()
-        feat["pr_avg_12m"]         = g["PR"].tail(LOOKBACK_LONG).mean()
-        feat["pr_std_12m"]         = g["PR"].tail(LOOKBACK_LONG).std()
-        feat["pr_last"]            = g["PR"].iloc[-1]
-
-        ly_pr = g[g["MONTH"] == same_month_ly]["PR"]
-        feat["pr_same_month_ly"]   = ly_pr.iloc[0] if len(ly_pr) > 0 else feat["pr_avg_12m"]
-
-        ly2_pr = g[g["MONTH"] == same_month_2y]["PR"]
-        feat["pr_same_month_2y"]   = ly2_pr.iloc[0] if len(ly2_pr) > 0 else feat["pr_avg_12m"]
-
-        # ── Historical profit features ────────────────────────────────────────
-        feat["profit_avg_3m"]       = g["profit"].tail(LOOKBACK_SHORT).mean()
-        feat["profit_avg_12m"]      = g["profit"].tail(LOOKBACK_LONG).mean()
-        feat["profit_last"]         = g["profit"].iloc[-1]
-
-        feat["profit_rate_3m"]      = g["is_profitable"].tail(LOOKBACK_SHORT).mean()
-        feat["profit_rate_6m"]      = g["is_profitable"].tail(LOOKBACK_MEDIUM).mean()
-        feat["profit_rate_12m"]     = g["is_profitable"].tail(LOOKBACK_LONG).mean()
-        feat["profit_rate_24m"]     = g["is_profitable"].tail(LOOKBACK_LONG2).mean()
-        feat["profit_last_month"]   = g["is_profitable"].iloc[-1]
-
-        # Consecutive profitable months streak
-        streak = 0
-        for val in reversed(g["is_profitable"].values):
-            if val == 1:
-                streak += 1
-            else:
-                break
-        feat["profit_streak"]       = streak
-
-        # Ever profitable in last 12m
-        feat["ever_profitable_12m"] = int(g["is_profitable"].tail(LOOKBACK_LONG).sum() > 0)
-
-        # Same month last year profitability
-        ly_p = g[g["MONTH"] == same_month_ly]["is_profitable"]
-        feat["profitable_same_month_ly"] = ly_p.iloc[0] if len(ly_p) > 0 else 0
-
-        ly_profit = g[g["MONTH"] == same_month_ly]["profit"]
-        feat["profit_same_month_ly"] = ly_profit.iloc[0] if len(ly_profit) > 0 else 0
-
-        # ── Estimated profit proxy (using history, no sim) ────────────────────
-        feat["est_profit_ly"]        = (feat["pr_same_month_ly"] -
-                                         feat["cost_same_month_ly"])
-        feat["est_profit_3m"]        = feat["pr_avg_3m"] - feat["cost_avg_3m"]
-        feat["est_profit_12m"]       = feat["pr_avg_12m"] - feat["cost_avg_12m"]
-
-        feat["n_months_history"]     = len(g)
+        feat.update(_seasonal(g, same_month_ly, same_month_2ly, same_month_3ly))
+        feat.update(_persistence(g))
+        feat.update(_pr_features(g))
+        feat.update(_cost_features(g, same_month_ly, same_month_2ly))
+        feat.update(_sim_features(sim))
+        feat.update(_combined(feat))
+        feat.update(_temporal(target_month))
+        feat["n_months_history"] = len(g)
+        feat["has_any_history"]  = int(len(g) > 0)
 
         rows.append(feat)
 
     result = pd.DataFrame(rows).fillna(0)
-    return result
+    result["TARGET_MONTH"] = target_month
 
-
-def _build_sim_features_merged(
-    merged: pd.DataFrame,
-    hist_feats: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    After merging sim_agg into historical features, compute derived sim features.
-    """
-    # Primary signal: simulated profit proxy
-    # Use estimated cost from history vs simulated price
-    if "psm_abs_mean" in merged.columns:
-        merged["sim_profit_mean"]   = merged["psm_abs_mean"] - merged["cost_avg_3m"]
-        merged["sim_profit_ly"]     = merged["psm_abs_mean"] - merged["cost_same_month_ly"]
-        merged["sim_profit_min"]    = merged.get("psm_abs_min", merged["psm_abs_mean"]) - merged["cost_avg_3m"]
-        merged["sim_profit_pos"]    = (merged["sim_profit_mean"] > 0).astype(int)
-
-        # Ratio of simulated to historical price
-        merged["psm_to_pr_ratio_3m"] = merged["psm_abs_mean"] / (merged["pr_avg_3m"] + 1e-9)
-        merged["psm_to_pr_ratio_ly"] = merged["psm_abs_mean"] / (merged["pr_same_month_ly"] + 1e-9)
-
-        # Uncertainty across scenarios
-        if "psm_abs_std" in merged.columns:
-            merged["psm_uncertainty"] = merged["psm_abs_std"] / (merged["psm_abs_mean"] + 1e-9)
-
-    return merged
-
-
-def _build_sim_features(
-    sim_agg: pd.DataFrame,
-    hist_feats: pd.DataFrame,
-) -> pd.DataFrame:
-    """Derive sim-based features as a standalone step."""
-    # Placeholder — actual work done in _build_sim_features_merged
-    return sim_agg
-
-
-def _add_temporal_features(
-    features: pd.DataFrame,
-    target_month: str,
-) -> pd.DataFrame:
-    """Add calendar-based features for seasonality."""
-    period = pd.Period(target_month, freq="M")
-    month_num = period.month
-
-    features["month_of_year"]  = month_num
-    features["is_winter"]      = int(month_num in [11, 12, 1, 2, 3])
-    features["is_summer"]      = int(month_num in [6, 7, 8, 9])
-    features["is_shoulder"]    = int(month_num in [4, 5, 10])
-    features["quarter"]        = (month_num - 1) // 3 + 1
-
-    # Cyclical encoding (better than raw month number for ML)
-    features["month_sin"]      = np.sin(2 * np.pi * month_num / 12)
-    features["month_cos"]      = np.cos(2 * np.pi * month_num / 12)
-
-    return features
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FEATURE MATRIX for multiple months (full walk-forward)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_feature_matrix(
-    truth: pd.DataFrame,
-    target_months: list,
-    sim_loader_fn=None,
-) -> pd.DataFrame:
-    """
-    Build feature matrix for a list of target months.
-    Respects walk-forward: each month only sees past data.
-
-    Parameters
-    ----------
-    truth          : full ground truth DataFrame (all months)
-    target_months  : list of YYYY-MM strings to build features for
-    sim_loader_fn  : optional callable(target_month) → sim_agg DataFrame
-                     (pass None to skip sim features)
-
-    Returns
-    -------
-    DataFrame: all features stacked, with TARGET_MONTH column
-    """
-    all_features = []
-
-    for i, target_month in enumerate(target_months):
-        cutoff_month = add_months(target_month, -1)
-
-        print(f"\n  [{i+1}/{len(target_months)}] Building features for "
-              f"{target_month} (cutoff: {cutoff_month})")
-
-        # ANTI-LEAKAGE: only use truth up to cutoff month
-        truth_past = truth[truth["MONTH"] < target_month].copy()
-
-        if len(truth_past) == 0:
-            print(f"    SKIP: no historical data before {target_month}")
-            continue
-
-        # Load sim_monthly if loader provided
-        sim_agg = None
-        if sim_loader_fn is not None:
-            try:
-                sim_raw = load_sim_monthly_for_target(target_month)
-                if sim_raw is not None:
-                    sim_agg = aggregate_sim_across_scenarios(sim_raw)
-            except Exception as e:
-                print(f"    WARNING: sim loading failed: {e}")
-
-        feats = build_features_for_month(
-            target_month=target_month,
-            truth=truth_past,
-            sim_agg=sim_agg,
-        )
-        all_features.append(feats)
-
-    if not all_features:
-        raise ValueError("No features were built. Check date ranges.")
-
-    result = pd.concat(all_features, ignore_index=True)
-    print(f"\n  ✓ Feature matrix: {result.shape} "
-          f"({result['TARGET_MONTH'].nunique()} months)")
+    elapsed = time.time() - t0
+    print(f"    features: {len(result):,} candidates | "
+          f"{len(result.columns)-3} features | {elapsed:.1f}s")
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FEATURE COLUMNS
+# FEATURE GROUP 1 — SEASONAL PERSISTENCE
+# The single strongest signal: +25.7% lift from EDA
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_feature_columns(df: pd.DataFrame) -> list:
-    """Return list of feature columns (exclude ID and target columns)."""
-    exclude = {
-        "EID", "PEAKID", "TARGET_MONTH", "MONTH",
-        "PR", "C", "profit", "is_profitable",
-        "SCENARIOID", "n_hours",
+def _seasonal(
+    g: pd.DataFrame,
+    same_month_ly: str,
+    same_month_2ly: str,
+    same_month_3ly: str,
+) -> dict:
+    feat = {}
+
+    for suffix, month in [
+        ("ly",  same_month_ly),
+        ("2ly", same_month_2ly),
+        ("3ly", same_month_3ly),
+    ]:
+        row = g[g["MONTH"] == month]
+        if len(row) > 0:
+            r = row.iloc[0]
+            feat[f"profitable_{suffix}"]  = int(r["is_profitable"])
+            feat[f"pr_{suffix}"]          = float(r["PR"])
+            feat[f"profit_{suffix}"]      = float(r["profit"])
+            feat[f"c_{suffix}"]           = float(r["C"])
+        else:
+            feat[f"profitable_{suffix}"]  = 0
+            feat[f"pr_{suffix}"]          = 0.0
+            feat[f"profit_{suffix}"]      = 0.0
+            feat[f"c_{suffix}"]           = 0.0
+
+    # How many of the last 3 same-month-LY observations were profitable?
+    feat["seasonal_consistency"] = (
+        feat["profitable_ly"] +
+        feat["profitable_2ly"] +
+        feat["profitable_3ly"]
+    )  # 0-3 scale
+    return feat
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE GROUP 2 — HISTORICAL PROFITABILITY PERSISTENCE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _persistence(g: pd.DataFrame) -> dict:
+    if len(g) == 0:
+        return {
+            "profit_rate_3m":       0.0,
+            "profit_rate_6m":       0.0,
+            "profit_rate_12m":      0.0,
+            "profit_rate_24m":      0.0,
+            "profit_last_month":    0,
+            "profit_streak":        0,
+            "profitable_last_3_all":0,
+            "profit_avg_3m":        0.0,
+            "profit_avg_12m":       0.0,
+            "profit_max_12m":       0.0,
+        }
+
+    feat = {
+        "profit_rate_3m":    float(g["is_profitable"].tail(3).mean()),
+        "profit_rate_6m":    float(g["is_profitable"].tail(6).mean()),
+        "profit_rate_12m":   float(g["is_profitable"].tail(12).mean()),
+        "profit_rate_24m":   float(g["is_profitable"].tail(24).mean()),
+        "profit_last_month": int(g["is_profitable"].iloc[-1]),
+        "profit_avg_3m":     float(g["profit"].tail(3).mean()),
+        "profit_avg_12m":    float(g["profit"].tail(12).mean()),
+        "profit_max_12m":    float(g["profit"].tail(12).max()),
     }
+
+    # Consecutive profitable months ending at cutoff
+    streak = 0
+    for val in reversed(g["is_profitable"].values.tolist()):
+        if val == 1:
+            streak += 1
+        else:
+            break
+    feat["profit_streak"]         = streak
+    feat["profitable_last_3_all"] = int(
+        len(g) >= 3 and g["is_profitable"].tail(3).sum() == 3
+    )
+    return feat
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE GROUP 3 — REALIZED PRICE (PR) FEATURES
+# Key insight: 98.4% of candidates have C=0, so profitability ≈ PR > 0
+# Main task: predict ACTIVATION, not price magnitude
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pr_features(g: pd.DataFrame) -> dict:
+    if len(g) == 0:
+        return {
+            "pr_avg_3m":           0.0,
+            "pr_avg_12m":          0.0,
+            "pr_last":             0.0,
+            "pr_std_12m":          0.0,
+            "pr_max_12m":          0.0,
+            "pr_nonzero_rate_12m": 0.0,
+            "pr_nonzero_rate_24m": 0.0,
+            "pr_ever_nonzero":     0,
+            "pr_avg_when_active":  0.0,
+            "pr_count_active_12m": 0,
+        }
+
+    active = g[g["PR"] > 0]
+    feat = {
+        "pr_avg_3m":           float(g["PR"].tail(3).mean()),
+        "pr_avg_12m":          float(g["PR"].tail(12).mean()),
+        "pr_last":             float(g["PR"].iloc[-1]),
+        "pr_std_12m":          float(g["PR"].tail(12).std()) if len(g) >= 2 else 0.0,
+        "pr_max_12m":          float(g["PR"].tail(12).max()),
+        # Activation rate — most important PR feature
+        "pr_nonzero_rate_12m": float((g["PR"] > 0).tail(12).mean()),
+        "pr_nonzero_rate_24m": float((g["PR"] > 0).tail(24).mean()),
+        "pr_ever_nonzero":     int(g["PR"].sum() > 0),
+        "pr_count_active_12m": int((g["PR"] > 0).tail(12).sum()),
+        # Average PR when actually active — not diluted by zero months
+        # An EID earning $5000 every 3 months has pr_avg_12m=$1667 (misleading)
+        # but pr_avg_when_active=$5000 (the true signal when it fires)
+        "pr_avg_when_active":  float(active["PR"].mean()) if len(active) > 0 else 0.0,
+    }
+    return feat
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE GROUP 4 — COST (C) FEATURES
+# C for M+1 is unknown at decision time — must estimate from history
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cost_features(
+    g: pd.DataFrame,
+    same_month_ly: str,
+    same_month_2ly: str,
+) -> dict:
+    if len(g) == 0:
+        return {
+            "c_last":            0.0,
+            "c_avg_3m":          0.0,
+            "c_avg_12m":         0.0,
+            "c_same_month_ly":   0.0,
+            "c_same_month_2ly":  0.0,
+            "c_nonzero_rate_12m":0.0,
+            "c_avg_when_nonzero":0.0,
+            "c_std_12m":         0.0,
+            "c_trend":           0.0,
+            "is_zero_cost_hist": 1,
+        }
+
+    c_ly_row  = g[g["MONTH"] == same_month_ly]
+    c_2ly_row = g[g["MONTH"] == same_month_2ly]
+    c_12m     = g["C"].tail(12)
+
+    nonzero_c = g[g["C"] > 0]
+
+    feat = {
+        "c_last":            float(g["C"].iloc[-1]),
+        "c_avg_3m":          float(g["C"].tail(3).mean()),
+        "c_avg_12m":         float(c_12m.mean()),
+        "c_same_month_ly":   float(c_ly_row["C"].iloc[0])  if len(c_ly_row) > 0  else 0.0,
+        "c_same_month_2ly":  float(c_2ly_row["C"].iloc[0]) if len(c_2ly_row) > 0 else 0.0,
+        "c_nonzero_rate_12m":float((c_12m > 0).mean()),
+        "c_avg_when_nonzero":float(nonzero_c["C"].mean()) if len(nonzero_c) > 0 else 0.0,
+        "c_std_12m":         float(c_12m.std()) if len(c_12m) >= 2 else 0.0,
+        "is_zero_cost_hist": int(g["C"].sum() == 0),
+    }
+
+    # Cost trend: is cost increasing or decreasing?
+    c6 = g["C"].tail(6).values
+    if len(c6) >= 3:
+        feat["c_trend"] = float(np.polyfit(range(len(c6)), c6, 1)[0])
+    else:
+        feat["c_trend"] = 0.0
+
+    return feat
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE GROUP 5 — SIMULATION (PSM / ACTIVATIONLEVEL)
+# Primary forward-looking signal — allowed because sim for M+1 is
+# produced BEFORE day 7 of month M (explicitly stated in case doc)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sim_features(sim_row: Optional[pd.Series]) -> dict:
+    zeros = {
+        "psm_abs_mean":       0.0,
+        "psm_abs_min":        0.0,
+        "psm_abs_max":        0.0,
+        "psm_abs_std":        0.0,
+        "psm_scenario_agree": 0,
+        "psm_s1":             0.0,
+        "psm_s2":             0.0,
+        "psm_s3":             0.0,
+        "act_mean":           0.0,
+        "act_max":            0.0,
+        "act_pos_frac":       0.0,
+        "wind_mean":          0.0,
+        "solar_mean":         0.0,
+        "hydro_mean":         0.0,
+        "nonrenew_mean":      0.0,
+        "external_mean":      0.0,
+        "load_mean":          0.0,
+        "transmission_mean":  0.0,
+        "source_impact_sum":  0.0,
+        "sim_in_universe":    0,
+        "sim_predicts_active":0,
+    }
+    if sim_row is None:
+        return zeros
+
+    return {
+        "psm_abs_mean":       float(sim_row.get("psm_abs_mean", 0)),
+        "psm_abs_min":        float(sim_row.get("psm_abs_min", 0)),
+        "psm_abs_max":        float(sim_row.get("psm_abs_max", 0)),
+        "psm_abs_std":        float(sim_row.get("psm_abs_std", 0)),
+        "psm_scenario_agree": int(sim_row.get("scenario_agree", 0)),
+        "psm_s1":             float(sim_row.get("psm_s1", 0)),
+        "psm_s2":             float(sim_row.get("psm_s2", 0)),
+        "psm_s3":             float(sim_row.get("psm_s3", 0)),
+        "act_mean":           float(sim_row.get("act_mean", 0)),
+        "act_max":            float(sim_row.get("act_max", 0)),
+        "act_pos_frac":       float(sim_row.get("act_pos_frac", 0)),
+        "wind_mean":          float(sim_row.get("wind_mean", 0)),
+        "solar_mean":         float(sim_row.get("solar_mean", 0)),
+        "hydro_mean":         float(sim_row.get("hydro_mean", 0)),
+        "nonrenew_mean":      float(sim_row.get("nonrenew_mean", 0)),
+        "external_mean":      float(sim_row.get("external_mean", 0)),
+        "load_mean":          float(sim_row.get("load_mean", 0)),
+        "transmission_mean":  float(sim_row.get("transmission_mean", 0)),
+        "source_impact_sum":  float(sim_row.get("source_impact_sum", 0)),
+        "sim_in_universe":    1,
+        "sim_predicts_active":int(float(sim_row.get("act_mean", 0)) > 0),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE GROUP 6 — COMBINED SIGNALS
+# Interaction features — often the most predictive for LightGBM
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _combined(feat: dict) -> dict:
+    psm        = feat.get("psm_abs_mean", 0)
+    pr_12m     = feat.get("pr_avg_12m", 0)
+    pr_active  = feat.get("pr_avg_when_active", 0)
+    act_rate   = feat.get("pr_nonzero_rate_12m", 0)
+    c_avg      = feat.get("c_avg_12m", 0)
+    c_ly       = feat.get("c_same_month_ly", 0)
+    profitable_ly  = feat.get("profitable_ly", 0)
+    profit_12m     = feat.get("profit_rate_12m", 0)
+    streak         = feat.get("profit_streak", 0)
+    sim_active     = feat.get("sim_predicts_active", 0)
+    sim_agree      = feat.get("psm_scenario_agree", 0)
+
+    # ── Simulated profit proxy: PSM as price estimate vs cost estimate ─────
+    # This is the closest we can get to |PR_{M+1}| - C_{M+1} at decision time
+    # Use conservative cost estimate (same month LY or recent avg)
+    c_estimate = c_ly if c_ly > 0 else c_avg
+    combined = {
+        "sim_profit_est":          psm - c_estimate,
+        "sim_profit_est_positive": int(psm > c_estimate),
+        "sim_profit_conservative": float(feat.get("psm_abs_min", 0)) - c_estimate,
+    }
+
+    # ── PSM vs historical PR ratios ────────────────────────────────────────
+    combined["psm_vs_pr_ratio_12m"]    = psm / (pr_12m   + 1e-9)
+    combined["psm_vs_pr_ratio_active"] = psm / (pr_active + 1e-9)
+
+    # ── Signal agreement features ─────────────────────────────────────────
+    # Both sim AND history agree → strongest confirmation
+    combined["sim_and_history_agree"] = int(sim_active == 1 and act_rate > 0.1)
+    combined["sim_confirms_seasonal"] = int(profitable_ly == 1 and sim_active == 1)
+
+    # Count of bullish signals (0-5 scale)
+    n_bullish = (
+        int(profitable_ly == 1) +
+        int(profit_12m > 0.5) +
+        int(sim_active == 1) +
+        int(sim_agree == 1) +
+        int(streak >= 2)
+    )
+    combined["n_bullish_signals"] = n_bullish
+    combined["high_confidence"]   = int(n_bullish >= 3)
+
+    # Bearish flag: all signals negative → definitely don't select
+    combined["all_signals_negative"] = int(
+        profitable_ly == 0 and
+        profit_12m < 0.1 and
+        sim_active == 0
+    )
+
+    # PSM uncertainty: high std across scenarios = unreliable forecast
+    psm_std = feat.get("psm_abs_std", 0)
+    combined["psm_cv"] = psm_std / (psm + 1e-9)  # coefficient of variation
+
+    return combined
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE GROUP 7 — TEMPORAL / CALENDAR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _temporal(target_month: str) -> dict:
+    period    = pd.Period(target_month, freq="M")
+    month_num = period.month
+    return {
+        "month_of_year": month_num,
+        "is_winter":     int(month_num in [11, 12, 1, 2, 3]),
+        "is_summer":     int(month_num in [6, 7, 8, 9]),
+        "is_shoulder":   int(month_num in [4, 5, 10]),
+        "quarter":       (month_num - 1) // 3 + 1,
+        "month_sin":     float(np.sin(2 * np.pi * month_num / 12)),
+        "month_cos":     float(np.cos(2 * np.pi * month_num / 12)),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE COLUMN LISTS (for model.py to reference)
+# ─────────────────────────────────────────────────────────────────────────────
+
+ID_COLS = ["EID", "PEAKID", "TARGET_MONTH"]
+LABEL_COLS = ["is_profitable", "profit"]
+
+ALL_FEATURE_COLS = [
+    # Seasonal
+    "profitable_ly", "profitable_2ly", "profitable_3ly",
+    "pr_ly", "profit_ly", "c_ly",
+    "seasonal_consistency",
+    # Persistence
+    "profit_rate_3m", "profit_rate_6m", "profit_rate_12m", "profit_rate_24m",
+    "profit_last_month", "profit_streak", "profitable_last_3_all",
+    "profit_avg_3m", "profit_avg_12m", "profit_max_12m",
+    # PR
+    "pr_avg_3m", "pr_avg_12m", "pr_last", "pr_std_12m", "pr_max_12m",
+    "pr_nonzero_rate_12m", "pr_nonzero_rate_24m",
+    "pr_ever_nonzero", "pr_avg_when_active", "pr_count_active_12m",
+    # Cost
+    "c_last", "c_avg_3m", "c_avg_12m", "c_same_month_ly", "c_same_month_2ly",
+    "c_nonzero_rate_12m", "c_avg_when_nonzero", "c_std_12m",
+    "c_trend", "is_zero_cost_hist",
+    # Sim
+    "psm_abs_mean", "psm_abs_min", "psm_abs_max", "psm_abs_std",
+    "psm_scenario_agree", "psm_s1", "psm_s2", "psm_s3",
+    "act_mean", "act_max", "act_pos_frac",
+    "wind_mean", "solar_mean", "hydro_mean", "nonrenew_mean", "external_mean",
+    "load_mean", "transmission_mean", "source_impact_sum",
+    "sim_in_universe", "sim_predicts_active",
+    # Combined
+    "sim_profit_est", "sim_profit_est_positive", "sim_profit_conservative",
+    "psm_vs_pr_ratio_12m", "psm_vs_pr_ratio_active",
+    "sim_and_history_agree", "sim_confirms_seasonal",
+    "n_bullish_signals", "high_confidence", "all_signals_negative", "psm_cv",
+    # Temporal
+    "month_of_year", "is_winter", "is_summer", "is_shoulder",
+    "quarter", "month_sin", "month_cos",
+    # Meta
+    "n_months_history", "has_any_history",
+]
+
+
+def get_feature_cols(df: pd.DataFrame) -> list:
+    """Return only columns that are actual features (not ID or label cols)."""
+    exclude = set(ID_COLS + LABEL_COLS + ["MONTH", "PR", "C", "SCENARIOID"])
     return [c for c in df.columns if c not in exclude]
-
-
-def get_id_columns() -> list:
-    return ["EID", "PEAKID", "TARGET_MONTH"]
